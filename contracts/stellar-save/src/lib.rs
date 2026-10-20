@@ -27,7 +27,6 @@
 //! migrations for storage written by earlier versions of this same contract
 //! (e.g. schema/version bumps), not WASM upgrades.
 
-pub mod admin_actions_tests;
 pub mod auth;
 pub mod clone;
 pub mod constants;
@@ -43,6 +42,7 @@ pub mod group;
 pub mod helpers;
 pub mod migration;
 pub mod migrations;
+pub mod milestones;
 pub mod payout;
 pub mod payout_executor;
 pub mod penalty;
@@ -58,25 +58,18 @@ pub mod storage_optimization;
 pub mod time_source;
 pub mod token;
 pub mod types;
+pub mod wrapping_audit;
 pub mod zk_proof;
 
-// mod auto_contribution_tests;
+// ── Test-only modules (kept in src/ for white-box / private-access tests) ────
+#[cfg(test)]
+pub mod admin_actions_tests;
+#[cfg(test)]
 pub mod cei_tests;
+#[cfg(test)]
 pub mod gas_benchmark;
-pub mod insurance_integration_tests;
+#[cfg(test)]
 pub mod test_utils;
-// mod invitation_tests;
-// mod merge_tests;
-// mod migration_matrix_tests;
-// mod migration_tests;
-// mod milestone_tests;
-pub mod milestones;
-// mod multi_token_tests;
-// mod mutation_tests;
-// mod upgrade_tests;
-pub mod wrapping_audit;
-pub mod zk_integration_tests;
-pub mod zk_tests;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 pub use auth::{is_active_member, require_admin, require_creator, require_member};

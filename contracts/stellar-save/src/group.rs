@@ -361,7 +361,11 @@ impl Group {
         penalty_enabled: bool,
         penalty_amount: i128,
     ) -> Self {
-        // Validate contribution amount
+        // SAFETY: All callers (contract.rs create_group) validate these fields
+        // before calling Group::new / Group::new_with_penalty and return a typed
+        // StellarSaveError to the user rather than reaching this assertion.
+        // These assert! calls serve only as last-resort invariant guards for
+        // code paths that bypass the contract entry point (e.g. test helpers).
         assert!(
             contribution_amount > 0,
             "contribution_amount must be greater than 0"
@@ -434,15 +438,19 @@ impl Group {
     /// # Arguments
     /// * `env` - Soroban environment for event emission
     ///
-    /// # Panics
-    /// Panics if the group is already complete.
-    pub fn complete(&mut self, env: &soroban_sdk::Env) {
-        assert!(!self.is_complete(), "group is already complete");
+    /// # Returns
+    /// * `Ok(())` - Group marked as completed successfully
+    /// * `Err(StellarSaveError::InvalidState)` - Group is already complete
+    pub fn complete(&mut self, env: &soroban_sdk::Env) -> Result<(), crate::error::StellarSaveError> {
+        if self.is_complete() {
+            return Err(crate::error::StellarSaveError::InvalidState);
+        }
         self.status = GroupStatus::Completed;
         self.is_active = false;
 
         // Emit completion event
         Self::emit_completed_event(env, self.id);
+        Ok(())
     }
 
     /// Emits a GroupEvent::Completed event.
@@ -464,17 +472,21 @@ impl Group {
     /// # Arguments
     /// * `env` - Soroban environment for event emission
     ///
-    /// # Panics
-    /// Panics if the group is already complete or if the cycle counter would overflow.
-    pub fn advance_cycle(&mut self, env: &soroban_sdk::Env) {
-        assert!(!self.is_complete(), "group is already complete");
+    /// # Returns
+    /// * `Ok(())` - Cycle advanced successfully
+    /// * `Err(StellarSaveError::InvalidState)` - Group is already complete
+    /// * `Err(StellarSaveError::Overflow)` - Cycle counter would overflow (unreachable in practice)
+    pub fn advance_cycle(&mut self, env: &soroban_sdk::Env) -> Result<(), crate::error::StellarSaveError> {
+        if self.is_complete() {
+            return Err(crate::error::StellarSaveError::InvalidState);
+        }
         // Use checked_add to prevent silent overflow on the cycle counter.
         // In practice max_members is capped at MAX_MEMBERS (20), so overflow is
         // unreachable in production, but we guard it explicitly per invariant #12.
         self.current_cycle = self
             .current_cycle
             .checked_add(1)
-            .expect("cycle counter overflow");
+            .ok_or(crate::error::StellarSaveError::Overflow)?;
 
         // Mark as complete if we've reached the final cycle
         // Deactivate if we've reached the final cycle
@@ -485,6 +497,7 @@ impl Group {
             // Emit completion event
             Self::emit_completed_event(env, self.id);
         }
+        Ok(())
     }
 
     /// Deactivates the group, preventing further contributions.
