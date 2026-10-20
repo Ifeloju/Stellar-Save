@@ -1,27 +1,30 @@
-//! Payout Executor Module
+//! Execution layer — handles **HOW** the payout is transferred.
 //!
-//! This module implements the core fund distribution mechanism for the Stellar-Save
-//! ROSCA (Rotational Savings and Credit Association) smart contract.
+//! This module owns all execution-phase logic: pre-flight validation, fund
+//! transfer, record keeping, event emission, and cycle advancement.  Recipient
+//! *selection* (who receives the payout) is fully delegated to
+//! [`crate::payout`] — this module never re-implements selection logic.
 //!
-//! The payout executor orchestrates the automated transfer of pooled funds to eligible
-//! recipients when a savings cycle completes. It handles:
-//! - Cycle completion verification
-//! - Recipient identification based on payout position
-//! - Payout amount calculation
-//! - Fund transfer execution
-//! - Payout record creation
-//! - Member status updates
-//! - Cycle advancement
-//! - Event emission
-//!
-//! The design follows a permissionless execution model where any address can trigger
-//! payout execution once preconditions are met.
+//! **Call flow**
+//! ```text
+//! execute_payout
+//!     ├─ validate_cycle_complete          — all members contributed?
+//!     ├─ payout::identify_recipient       — WHO gets paid (selection layer)
+//!     ├─ verify_recipient_eligibility     — eligibility guard (execution layer)
+//!     ├─ calculate_and_validate_payout_amount
+//!     ├─ verify_contract_balance
+//!     ├─ record_payout                    — write audit record (CEI: effects first)
+//!     ├─ update_member_status
+//!     ├─ emit_payout_event                — non-critical
+//!     ├─ advance_cycle_or_complete
+//!     └─ execute_transfer                 — external token call (interactions last)
+//! ```
 
 use crate::auth::is_active_member;
 use crate::error::StellarSaveError;
 use crate::events::EventEmitter;
 use crate::group::{Group, GroupStatus};
-use crate::payout::{PayoutOrder, PayoutRecord};
+use crate::payout::{identify_recipient, PayoutRecord};
 use crate::pool::PoolCalculator;
 use crate::storage::StorageKeyBuilder;
 use crate::MemberProfile;
@@ -34,7 +37,7 @@ use soroban_sdk::{Address, Env};
 ///
 /// # Arguments
 /// * `env` - Soroban environment for storage access
-/// * `group_id` - Unique identifier of the group
+/// * `group` - Already-loaded group (avoids a redundant SLOAD)
 /// * `current_cycle` - The current cycle number to validate
 ///
 /// # Returns
@@ -66,172 +69,6 @@ fn validate_cycle_complete(
 
     // Return pool info for use in subsequent payout calculations
     Ok(pool_info)
-}
-
-/// Identifies the member who should receive the payout for the current cycle.
-///
-/// Gas opt: O(1) direct lookup using the `PayoutPositionIndex` reverse map
-/// written at join/assign time. A single SLOAD replaces the previous O(n)
-/// member-list scan.
-///
-/// # Arguments
-/// * `env` - Soroban environment for storage access
-/// * `group_id` - Unique identifier of the group
-/// * `current_cycle` - The current cycle number to match against payout positions
-/// * `member_count` - Total number of members in the group (for validation)
-///
-/// # Returns
-/// * `Ok(Address)` - The recipient's address
-/// * `Err(StellarSaveError)` - If no member found for this position
-fn identify_recipient(
-    env: &Env,
-    group_id: u64,
-    current_cycle: u32,
-    member_count: u32,
-    payout_order: &PayoutOrder,
-) -> Result<Address, StellarSaveError> {
-    match payout_order {
-        PayoutOrder::Random => identify_recipient_random(env, group_id, current_cycle),
-        PayoutOrder::Bid => identify_recipient_bid(env, group_id, current_cycle),
-        PayoutOrder::Sequential => {
-            identify_recipient_sequential(env, group_id, current_cycle, member_count)
-        }
-    }
-}
-
-/// Selects the recipient for `Sequential` order: the member whose payout_position
-/// equals `current_cycle` (O(1) via reverse index, O(n) fallback for legacy groups).
-fn identify_recipient_sequential(
-    env: &Env,
-    group_id: u64,
-    current_cycle: u32,
-    member_count: u32,
-) -> Result<Address, StellarSaveError> {
-    // Gas opt: O(1) reverse-index lookup instead of O(n) member-list scan.
-    // The index is written at join_group / assign_payout_positions time.
-    let pos_idx_key = StorageKeyBuilder::group_payout_position_index(group_id, current_cycle);
-    if let Some(recipient) = env.storage().persistent().get::<_, Address>(&pos_idx_key) {
-        // Sanity: position must be within the valid range for this group
-        if current_cycle < member_count {
-            return Ok(recipient);
-        }
-    }
-
-    // Fallback: reverse index not yet populated (legacy groups or first cycle
-    // before assign_payout_positions was called). Fall back to the O(n) scan
-    // so we remain backward-compatible.
-    let members_key = StorageKeyBuilder::group_members(group_id);
-    let members: soroban_sdk::Vec<Address> = env
-        .storage()
-        .persistent()
-        .get(&members_key)
-        .ok_or(StellarSaveError::GroupNotFound)?;
-
-    if members.len() != member_count {
-        return Err(StellarSaveError::InvalidState);
-    }
-
-    let mut recipient: Option<Address> = None;
-    let mut match_count = 0u32;
-
-    for member_address in members.iter() {
-        let pos_key =
-            StorageKeyBuilder::member_payout_eligibility(group_id, member_address.clone());
-        if let Some(position) = env.storage().persistent().get::<_, u32>(&pos_key) {
-            if position == current_cycle {
-                recipient = Some(member_address);
-                match_count += 1;
-            }
-        }
-    }
-
-    match match_count {
-        0 => Err(StellarSaveError::InvalidState),
-        1 => Ok(recipient.unwrap()),
-        _ => Err(StellarSaveError::InvalidState),
-    }
-}
-
-/// Selects the recipient for `Random` order: picks a random member who has not
-/// yet received a payout, using ledger sequence as entropy.
-fn identify_recipient_random(
-    env: &Env,
-    group_id: u64,
-    current_cycle: u32,
-) -> Result<Address, StellarSaveError> {
-    let members_key = StorageKeyBuilder::group_members(group_id);
-    let members: soroban_sdk::Vec<Address> = env
-        .storage()
-        .persistent()
-        .get(&members_key)
-        .ok_or(StellarSaveError::GroupNotFound)?;
-
-    // Collect members who have not yet received a payout.
-    let mut eligible: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(env);
-    for member in members.iter() {
-        // A member is eligible if they have no payout record for any prior cycle.
-        // We check the member_payout_eligibility flag: if it equals current_cycle
-        // the member has already been paid this cycle; otherwise they are eligible.
-        let paid_key = StorageKeyBuilder::member_payout_eligibility(group_id, member.clone());
-        let paid_cycle: Option<u32> = env.storage().persistent().get(&paid_key);
-        // paid_cycle stores the cycle at which the member received their payout.
-        // If it is None or points to a future cycle, the member hasn't been paid yet.
-        let already_paid = paid_cycle.map(|c| c < current_cycle).unwrap_or(false);
-        if !already_paid {
-            eligible.push_back(member);
-        }
-    }
-
-    if eligible.is_empty() {
-        return Err(StellarSaveError::InvalidState);
-    }
-
-    // Use Soroban PRNG + ledger timestamp as entropy source.
-    let prng_val = env.prng().u64_in_range(0..u64::MAX);
-    let ledger_salt = env.ledger().timestamp();
-    let idx = ((prng_val
-        .wrapping_add(ledger_salt)
-        .wrapping_add(group_id as u64))
-        % eligible.len() as u64) as u32;
-
-    Ok(eligible.get(idx).unwrap())
-}
-
-/// Selects the recipient for `Bid` order: the member with the highest bid for
-/// `current_cycle`. Ties are broken by member list order (first highest bidder wins).
-fn identify_recipient_bid(
-    env: &Env,
-    group_id: u64,
-    current_cycle: u32,
-) -> Result<Address, StellarSaveError> {
-    let members_key = StorageKeyBuilder::group_members(group_id);
-    let members: soroban_sdk::Vec<Address> = env
-        .storage()
-        .persistent()
-        .get(&members_key)
-        .ok_or(StellarSaveError::GroupNotFound)?;
-
-    let mut best_bidder: Option<Address> = None;
-    let mut best_bid: i128 = -1;
-
-    for member in members.iter() {
-        // Skip members who have already received a payout in a prior cycle.
-        let paid_key = StorageKeyBuilder::member_payout_eligibility(group_id, member.clone());
-        let paid_cycle: Option<u32> = env.storage().persistent().get(&paid_key);
-        let already_paid = paid_cycle.map(|c| c < current_cycle).unwrap_or(false);
-        if already_paid {
-            continue;
-        }
-
-        let bid_key = StorageKeyBuilder::group_bid_amount(group_id, current_cycle, member.clone());
-        let bid: i128 = env.storage().persistent().get(&bid_key).unwrap_or(0);
-        if bid > best_bid {
-            best_bid = bid;
-            best_bidder = Some(member);
-        }
-    }
-
-    best_bidder.ok_or(StellarSaveError::InvalidState)
 }
 
 /// Verifies that the identified recipient is eligible to receive the payout.
@@ -354,6 +191,7 @@ fn verify_contract_balance(
 ///
 /// # Arguments
 /// * `env` - Soroban environment for accessing contract address and token API
+/// * `group_id` - Unique identifier of the group (used to look up the token config)
 /// * `recipient` - Address of the recipient to receive the payout
 /// * `amount` - The amount to transfer (in stroops, where 1 XLM = 10^7 stroops)
 ///
@@ -365,16 +203,6 @@ fn verify_contract_balance(
 /// - `PayoutFailed` - Transfer failed due to insufficient funds, invalid recipient,
 ///   or other transfer-related errors
 /// - `Overflow` - Arithmetic overflow occurred during amount validation
-///
-/// # Implementation Note
-/// This is a placeholder implementation for the MVP. In production, this would:
-/// 1. Get the native token contract address from configuration
-/// 2. Create a token client for the native asset (XLM)
-/// 3. Execute the transfer using token.transfer(from, to, amount)
-/// 4. Handle specific transfer errors (insufficient balance, frozen account, etc.)
-///
-/// For now, this function validates the inputs and returns success to allow
-/// testing of the payout flow without requiring a full token integration.
 ///
 /// # Requirements
 /// Validates Requirements 4.1, 4.2, 4.3, 10.3, 10.4
@@ -405,6 +233,7 @@ fn execute_transfer(
 
     Ok(())
 }
+
 /// Creates and stores an immutable payout record.
 ///
 /// This function creates a PayoutRecord with all payout details and stores it in
@@ -489,12 +318,6 @@ fn record_payout(
 /// # Errors
 /// - `InternalError` - Member profile not found or storage operation failed
 ///
-/// # Implementation Note
-/// Since the payout receipt is tracked via the `payout_recipient` storage key
-/// (stored by the `record_payout` function), this function primarily validates
-/// that the member profile exists and is accessible. The actual payout status
-/// is queried via the `payout_recipient` storage key in the eligibility checks.
-///
 /// # Requirements
 /// Validates Requirements 6.1, 6.2, 6.3, 6.4, 6.5
 fn update_member_status(
@@ -535,10 +358,6 @@ fn update_member_status(
 /// to fail. Events are considered non-critical - if emission fails, the payout
 /// should still succeed and all state changes should be persisted.
 ///
-/// The function catches any panics or errors during event emission and logs them
-/// without propagating the error to the caller. This ensures that the payout
-/// execution flow continues even if the event system is unavailable or fails.
-///
 /// # Arguments
 /// * `env` - Soroban environment for event emission
 /// * `group_id` - Unique identifier of the group
@@ -549,21 +368,6 @@ fn update_member_status(
 ///
 /// # Returns
 /// This function always returns successfully, even if event emission fails.
-/// It does not return any value.
-///
-/// # Error Handling
-/// Any errors during event emission are caught and suppressed. The function
-/// continues execution without propagating errors to ensure that event failures
-/// do not cause payout transactions to revert.
-///
-/// # Usage in execute_payout
-/// This function should be called after all storage operations complete successfully
-/// but before cycle advancement. The recommended call sequence in execute_payout is:
-/// 1. execute_transfer() - Transfer funds to recipient
-/// 2. record_payout() - Store payout record
-/// 3. update_member_status() - Update member status
-/// 4. emit_payout_event() - Emit event (non-critical, continues on failure)
-/// 5. advance_cycle_or_complete() - Advance to next cycle
 ///
 /// # Requirements
 /// Validates Requirements 7.1, 7.2, 7.3, 7.4, 7.5
@@ -575,17 +379,6 @@ fn emit_payout_event(
     cycle: u32,
     timestamp: u64,
 ) {
-    // Wrap event emission in error handling that continues on failure
-    // Events are non-critical - if emission fails, the payout should still succeed
-    //
-    // Note: In Soroban, the events().publish() method does not return a Result,
-    // so we don't need explicit error handling. However, we wrap this in a
-    // separate function to make it clear that event emission is non-critical
-    // and to provide a single point where event emission can be controlled.
-    //
-    // If the event system fails internally, Soroban will handle it gracefully
-    // without causing the transaction to revert.
-
     EventEmitter::emit_payout_executed(env, group_id, recipient.clone(), amount, cycle, timestamp);
 
     // Issue #754: emit structured contribution receipt for indexer
@@ -599,10 +392,8 @@ fn emit_payout_event(
             timestamp,
         },
     );
-
-    // Event emission completed (or failed gracefully)
-    // The payout flow continues regardless of event emission status
 }
+
 /// Advances the group to the next cycle or marks it as complete.
 ///
 /// This function calls the Group's advance_cycle method to increment the cycle number
@@ -624,17 +415,6 @@ fn emit_payout_event(
 ///
 /// # Errors
 /// - `InternalError` - Failed to save updated group to storage
-///
-/// # Panics
-/// Panics if the group is already complete (should not occur in normal payout flow)
-///
-/// # Implementation Note
-/// The Group.advance_cycle method handles all the cycle advancement logic including:
-/// - Status updates (Active -> Completed when all cycles done)
-/// - Event emission (GroupCompleted event)
-/// - State validation (panics if already complete)
-///
-/// This function's responsibility is to call advance_cycle and persist the changes.
 ///
 /// # Requirements
 /// Validates Requirements 8.1, 8.2, 8.3, 8.4, 8.5, 8.6
@@ -667,8 +447,8 @@ fn advance_cycle_or_complete(env: &Env, group: &mut Group) -> Result<(), Stellar
 /// Applies penalties to all members who missed their contribution in the given cycle.
 ///
 /// Iterates over all group members, checks if each one contributed in `cycle`, and
-/// calls `apply_penalty` for those who did not. The penalty amount is added to the
-/// cycle pool total so the payout recipient receives it.
+/// adds the configured penalty to their running total. The penalty amount is also
+/// added to the cycle pool total so the payout recipient receives it.
 ///
 /// This function is a no-op when `group.penalty_enabled` is false or
 /// `group.penalty_amount` is zero.
@@ -726,15 +506,15 @@ fn apply_missed_contribution_penalties(
 /// 2. Validate group status is Active
 /// 3. Check if payout already executed for current cycle
 /// 4. Validate cycle is complete (all members contributed)
-/// 5. Identify the recipient based on payout position
+/// 5. Identify the recipient via [`crate::payout::identify_recipient`]
 /// 6. Verify recipient eligibility
 /// 7. Calculate payout amount
 /// 8. Verify contract has sufficient balance
-/// 9. Execute fund transfer to recipient
-/// 10. Record payout for audit trail
-/// 11. Update member status
-/// 12. Emit payout event (non-critical)
-/// 13. Advance cycle or mark group as complete
+/// 9. Record payout for audit trail (CEI: effects before interactions)
+/// 10. Update member status
+/// 11. Emit payout event (non-critical)
+/// 12. Advance cycle or mark group as complete
+/// 13. Execute fund transfer to recipient (interactions last)
 ///
 /// # Arguments
 /// * `env` - Soroban environment for storage, ledger access, and event emission
@@ -817,7 +597,7 @@ pub fn execute_payout(env: Env, group_id: u64) -> Result<(), StellarSaveError> {
         return Err(StellarSaveError::InvalidState);
     }
 
-    // === VALIDATION PHASE (Task 12.2) ===
+    // === VALIDATION PHASE ===
     // All validation checks must pass before any state modifications occur
 
     // Step 4: Validate cycle is complete (all members have contributed)
@@ -829,7 +609,9 @@ pub fn execute_payout(env: Env, group_id: u64) -> Result<(), StellarSaveError> {
         apply_missed_contribution_penalties(&env, group_id, current_cycle, &group)?;
     }
 
-    // Step 5: Identify the recipient for this cycle based on payout position
+    // Step 5: Identify the recipient for this cycle via the selection layer.
+    // All recipient-selection logic lives in crate::payout; this module only
+    // calls into it.
     let recipient = identify_recipient(
         &env,
         group_id,
@@ -847,7 +629,7 @@ pub fn execute_payout(env: Env, group_id: u64) -> Result<(), StellarSaveError> {
     // Step 8: Verify contract has sufficient balance to cover the payout
     verify_contract_balance(&env, group_id, payout_amount)?;
 
-    // === EFFECTS PHASE (Task 12.3) ===
+    // === EFFECTS PHASE ===
     // All validations passed. Checks-effects-interactions: every state mutation
     // below is committed *before* the token transfer, so a caller-supplied token
     // contract that calls back during `transfer` sees a fully settled cycle —
@@ -1416,12 +1198,7 @@ mod tests {
         let timestamp = 1234567890u64;
 
         // Event emission should not panic or fail
-        // This function always succeeds, even if event emission fails internally
         emit_payout_event(&env, group_id, recipient.clone(), amount, cycle, timestamp);
-
-        // No assertion needed - if we reach here, the function succeeded
-        // In a real test environment with event inspection, we would verify
-        // that the PayoutExecuted event was emitted with correct data
     }
 
     // Test emit_payout_event with large amount
@@ -1434,7 +1211,6 @@ mod tests {
         let amount = 1_000_000_000_000i128; // 100,000 XLM
         let timestamp = 1234567890u64;
 
-        // Event emission should handle large amounts without issue
         emit_payout_event(&env, group_id, recipient, amount, cycle, timestamp);
     }
 
@@ -1448,7 +1224,6 @@ mod tests {
         let amount = 1i128; // 1 stroop
         let timestamp = 1234567890u64;
 
-        // Event emission should handle minimum amount
         emit_payout_event(&env, group_id, recipient, amount, cycle, timestamp);
     }
 
@@ -1462,11 +1237,8 @@ mod tests {
         let amount = 5_000_000i128;
         let timestamp = 1234567890u64;
 
-        // Emit events for multiple cycles
         emit_payout_event(&env, group_id, recipient1, amount, 0, timestamp);
         emit_payout_event(&env, group_id, recipient2, amount, 1, timestamp + 604800);
-
-        // Both emissions should succeed
     }
 
     // Test emit_payout_event with different groups
@@ -1479,11 +1251,8 @@ mod tests {
         let amount = 5_000_000i128;
         let timestamp = 1234567890u64;
 
-        // Emit events for different groups
         emit_payout_event(&env, 1, recipient1, amount, cycle, timestamp);
         emit_payout_event(&env, 2, recipient2, amount, cycle, timestamp);
-
-        // Both emissions should succeed
     }
 
     // Test emit_payout_event is non-critical (always succeeds)
@@ -1496,18 +1265,12 @@ mod tests {
         let amount = 5_000_000i128;
         let timestamp = 1234567890u64;
 
-        // Call emit_payout_event multiple times
-        // This should never panic or fail, demonstrating non-critical behavior
         for _ in 0..10 {
             emit_payout_event(&env, group_id, recipient.clone(), amount, cycle, timestamp);
         }
-
-        // All emissions should succeed without error
     }
 
     // Test emit_payout_event with zero amount (edge case)
-    // Note: In production, this would not occur because payout validation
-    // prevents zero amounts, but we test the event emission is robust
     #[test]
     fn test_emit_payout_event_zero_amount() {
         let env = Env::default();
@@ -1517,12 +1280,8 @@ mod tests {
         let amount = 0i128; // Edge case - should not occur in production
         let timestamp = 1234567890u64;
 
-        // Event emission should not panic even with invalid data
-        // This demonstrates the non-critical nature of event emission
         emit_payout_event(&env, group_id, recipient, amount, cycle, timestamp);
     }
-
-    // Test advance_cycle_or_complete with valid group
 
     // Test advance_cycle_or_complete saves to correct storage key
     #[test]
@@ -1549,7 +1308,6 @@ mod tests {
         assert!(stored_group.is_some());
         assert_eq!(stored_group.unwrap().id, 42);
     }
-
 
     #[test]
     fn test_apply_missed_penalties_adds_to_pool() {
@@ -1606,7 +1364,6 @@ mod tests {
             .persistent()
             .set(&StorageKeyBuilder::group_members(group_id), &members);
 
-        // The function should still succeed but apply no penalties
         apply_missed_contribution_penalties(&env, group_id, cycle, &group).unwrap();
 
         let penalty_key = StorageKeyBuilder::member_penalty_total(group_id, member.clone());
